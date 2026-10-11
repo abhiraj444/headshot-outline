@@ -1,6 +1,7 @@
 import type { NextConfig } from "next";
 
 const nextConfig: NextConfig = {
+  output: "standalone",
   reactStrictMode: true,
   // transformers.js runs fully client-side (Web Worker). Stop webpack from trying to
   // bundle its Node-only backends.

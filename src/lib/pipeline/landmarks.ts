@@ -21,19 +21,23 @@ let FL: any = null;
 async function getLandmarker() {
   if (!landmarkerPromise) {
     landmarkerPromise = (async () => {
-      const vision = await import("@mediapipe/tasks-vision");
-      FL = vision.FaceLandmarker;
-      const files = await vision.FilesetResolver.forVisionTasks(WASM_URL);
-      const make = (delegate: "GPU" | "CPU") =>
-        vision.FaceLandmarker.createFromOptions(files, {
-          baseOptions: { modelAssetPath: MODEL_URL, delegate },
-          runningMode: "IMAGE",
-          numFaces: 1,
-        });
       try {
-        return await make("GPU");
+        const vision = await import("@mediapipe/tasks-vision");
+        FL = vision.FaceLandmarker;
+        const files = await vision.FilesetResolver.forVisionTasks(WASM_URL);
+        const make = (delegate: "GPU" | "CPU") =>
+          vision.FaceLandmarker.createFromOptions(files, {
+            baseOptions: { modelAssetPath: MODEL_URL, delegate },
+            runningMode: "IMAGE",
+            numFaces: 1,
+          });
+        try {
+          return await make("CPU");
+        } catch {
+          return await make("GPU");
+        }
       } catch {
-        return await make("CPU");
+        return null;
       }
     })();
     landmarkerPromise.catch(() => { landmarkerPromise = null; });
@@ -85,25 +89,34 @@ export function yawFromLandmarks(lm: { x: number; y: number }[]): number {
 }
 
 export async function detectLandmarkLines(canvas: HTMLCanvasElement): Promise<LandmarkLines | null> {
-  const lmk = await getLandmarker();
-  const res = lmk.detect(canvas) as { faceLandmarks: { x: number; y: number }[][] };
-  const lm = res?.faceLandmarks?.[0];
-  if (!lm || lm.length < 468) return null;
-  const w = canvas.width, h = canvas.height;
-  const toPts = (idx: number[]): Pt[] => idx.map((i) => ({ x: lm[i].x * w, y: lm[i].y * h }));
-  const lines = (conns: Conn[]) => chainConnections(conns).map(toPts);
-  const lips = chainConnections(FL.FACE_LANDMARKS_LIPS as Conn[]).map(toPts);
-  // the outer lip loop is the one with the larger extent
-  const extent = (p: Pt[]) => Math.max(...p.map((q) => q.x)) - Math.min(...p.map((q) => q.x));
-  const sorted = lips.sort((a, b) => extent(b) - extent(a));
-  const half = Math.ceil(sorted.length / 2);
-  return {
-    yawDeg: yawFromLandmarks(lm),
-    eyes: [...lines(FL.FACE_LANDMARKS_LEFT_EYE), ...lines(FL.FACE_LANDMARKS_RIGHT_EYE)],
-    brows: [...lines(FL.FACE_LANDMARKS_LEFT_EYEBROW), ...lines(FL.FACE_LANDMARKS_RIGHT_EYEBROW)],
-    lipsOuter: sorted.slice(0, half),
-    lipsInner: sorted.slice(half),
-    nose: [toPts(NOSE_BASE)],
-    iris: lm.length >= 478 ? [...lines(FL.FACE_LANDMARKS_LEFT_IRIS), ...lines(FL.FACE_LANDMARKS_RIGHT_IRIS)] : [],
-  };
+  const timeoutPromise = new Promise<null>((r) => setTimeout(() => r(null), 4000));
+  const detectPromise = (async (): Promise<LandmarkLines | null> => {
+    try {
+      const lmk = await getLandmarker();
+      if (!lmk || !FL) return null;
+      const res = lmk.detect(canvas) as { faceLandmarks: { x: number; y: number }[][] };
+      const lm = res?.faceLandmarks?.[0];
+      if (!lm || lm.length < 468) return null;
+      const w = canvas.width, h = canvas.height;
+      const toPts = (idx: number[]): Pt[] => idx.map((i) => ({ x: lm[i].x * w, y: lm[i].y * h }));
+      const lines = (conns: Conn[]) => chainConnections(conns).map(toPts);
+      const lips = chainConnections(FL.FACE_LANDMARKS_LIPS as Conn[]).map(toPts);
+      // the outer lip loop is the one with the larger extent
+      const extent = (p: Pt[]) => Math.max(...p.map((q) => q.x)) - Math.min(...p.map((q) => q.x));
+      const sorted = lips.sort((a, b) => extent(b) - extent(a));
+      const half = Math.ceil(sorted.length / 2);
+      return {
+        yawDeg: yawFromLandmarks(lm),
+        eyes: [...lines(FL.FACE_LANDMARKS_LEFT_EYE), ...lines(FL.FACE_LANDMARKS_RIGHT_EYE)],
+        brows: [...lines(FL.FACE_LANDMARKS_LEFT_EYEBROW), ...lines(FL.FACE_LANDMARKS_RIGHT_EYEBROW)],
+        lipsOuter: sorted.slice(0, half),
+        lipsInner: sorted.slice(half),
+        nose: [toPts(NOSE_BASE)],
+        iris: lm.length >= 478 ? [...lines(FL.FACE_LANDMARKS_LEFT_IRIS), ...lines(FL.FACE_LANDMARKS_RIGHT_IRIS)] : [],
+      };
+    } catch {
+      return null;
+    }
+  })();
+  return Promise.race([detectPromise, timeoutPromise]);
 }

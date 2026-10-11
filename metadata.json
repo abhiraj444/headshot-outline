@@ -1,0 +1,8 @@
+{
+  "name": "Headshot Outline",
+  "description": "Turn any photo into a clean head outline with facial line art processed in-browser, refined by an optional AI critic.",
+  "permissions": [],
+  "capabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}

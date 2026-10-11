@@ -23,13 +23,30 @@ let runner: PipelineRunner | null = null;
 
 async function pickDevice(pref: DevicePref): Promise<"webgpu" | "wasm"> {
   if (pref === "wasm") return "wasm";
-  const gpu = (navigator as Navigator & { gpu?: { requestAdapter(): Promise<unknown> } }).gpu;
-  if (!gpu) return "wasm";
+  if (pref === "webgpu") {
+    const gpu = (navigator as Navigator & { gpu?: { requestAdapter(): Promise<unknown> } }).gpu;
+    if (!gpu) return "wasm";
+    try {
+      const adapter = await gpu.requestAdapter();
+      return adapter ? "webgpu" : "wasm";
+    } catch {
+      return "wasm";
+    }
+  }
+  // For 'auto': prefer wasm. WebAssembly SIMD runs inside the dedicated worker without
+  // ever freezing Chrome's GPU process or locking up browser tab threads.
+  return "wasm";
+}
+
+async function withTimeout<T>(p: Promise<T>, ms: number, msg: string): Promise<T> {
+  let timer: ReturnType<typeof setTimeout>;
+  const t = new Promise<never>((_, reject) => {
+    timer = setTimeout(() => reject(new Error(`${msg} (timed out after ${Math.round(ms / 1000)}s)`)), ms);
+  });
   try {
-    const adapter = await gpu.requestAdapter();
-    return adapter ? "webgpu" : "wasm";
-  } catch {
-    return "wasm";
+    return await Promise.race([p, t]);
+  } finally {
+    clearTimeout(timer!);
   }
 }
 
@@ -56,10 +73,11 @@ async function loadPipe(
   };
   // Preferred weights per model (sizes: face-parsing q8 ≈ 89 MB vs fp32 ≈ 340 MB; MODNet fp32 ≈ 26 MB;
   // RMBG-1.4 q8 ≈ 44 MB / fp16 ≈ 88 MB).
+  // Note: WebGPU in ONNX Runtime Web does NOT support q8 quantization; must use fp32 or fp16.
   const DTYPES: Record<string, string[]> = {
-    [PARSING_MODEL_ID]: ["q8", "fp32"],
+    [PARSING_MODEL_ID]: device === "webgpu" ? ["fp32"] : ["q8", "fp32"],
     "Xenova/modnet": ["fp32", "q8"],
-    "briaai/RMBG-1.4": device === "webgpu" ? ["fp16", "q8", "fp32"] : ["q8", "fp32"],
+    "briaai/RMBG-1.4": device === "webgpu" ? ["fp16", "fp32"] : ["q8", "fp32"],
   };
   const dtypes = DTYPES[model] ?? ["fp32"];
   const attempts: Record<string, unknown>[] = [
@@ -85,33 +103,28 @@ function isOom(e: unknown) {
   return m.includes("memory") || m.includes("allocation") || m.includes("oom");
 }
 
-/** Run face parsing on a square crop around the head for better accuracy, then paste back. */
-async function parseWithCrop(seg: AnyPipe, img: RawImage, rgba: Uint8ClampedArray, w: number, h: number): Promise<Uint8Array> {
-  type Seg = { label: string | null; mask: RawImage };
-  const full = labelMapFromSegments((await seg(img)) as Seg[], w, h);
-  // bbox of head classes
-  let x0 = w, y0 = h, x1 = -1, y1 = -1;
-  for (let y = 0; y < h; y++) for (let x = 0; x < w; x++) {
-    const l = full[y * w + x];
-    if (l >= 1 && l <= 14) { if (x < x0) x0 = x; if (x > x1) x1 = x; if (y < y0) y0 = y; if (y > y1) y1 = y; }
+/** Downscale RGBA buffer to maximum side length (default 512px) for model inference */
+function resizeForInference(rgba: Uint8ClampedArray, w: number, h: number, maxSide = 512): RawImage {
+  if (Math.max(w, h) <= maxSide) {
+    return new RawImage(rgba, w, h, 4);
   }
-  if (x1 < 0) return full;
-  const side = Math.round(Math.max(x1 - x0, y1 - y0) * 1.6);
-  if (side * side > 0.6 * w * h || side < 32) return full;
-  const cx = (x0 + x1) / 2, cy = (y0 + y1) / 2;
-  const sx = Math.max(0, Math.min(w - side, Math.round(cx - side / 2)));
-  const sy = Math.max(0, Math.min(h - side, Math.round(cy - side / 2)));
-  const cw = Math.min(side, w), ch = Math.min(side, h);
-  const crop = new Uint8ClampedArray(cw * ch * 4);
-  for (let y = 0; y < ch; y++) crop.set(rgba.subarray(((sy + y) * w + sx) * 4, ((sy + y) * w + sx + cw) * 4), y * cw * 4);
-  const cropLabels = labelMapFromSegments((await seg(new RawImage(crop, cw, ch, 4))) as Seg[], cw, ch);
-  const out = full.slice();
-  // inside the crop, use the crop result; outside keep the full-image result but drop head classes
-  for (let y = 0; y < h; y++) for (let x = 0; x < w; x++) {
-    const inside = x >= sx && x < sx + cw && y >= sy && y < sy + ch;
-    out[y * w + x] = inside ? cropLabels[(y - sy) * cw + (x - sx)] : full[y * w + x];
+  const scale = maxSide / Math.max(w, h);
+  const rw = Math.max(16, Math.round(w * scale));
+  const rh = Math.max(16, Math.round(h * scale));
+  const dst = new Uint8ClampedArray(rw * rh * 4);
+  for (let y = 0; y < rh; y++) {
+    const sy = Math.min(h - 1, Math.floor(y / scale));
+    for (let x = 0; x < rw; x++) {
+      const sx = Math.min(w - 1, Math.floor(x / scale));
+      const sidx = (sy * w + sx) * 4;
+      const didx = (y * rw + x) * 4;
+      dst[didx] = rgba[sidx];
+      dst[didx + 1] = rgba[sidx + 1];
+      dst[didx + 2] = rgba[sidx + 2];
+      dst[didx + 3] = rgba[sidx + 3];
+    }
   }
-  return out;
+  return new RawImage(dst, rw, rh, 4);
 }
 
 async function handleSegment(req: Extract<WorkerRequest, { type: "segment" }>) {
@@ -119,16 +132,29 @@ async function handleSegment(req: Extract<WorkerRequest, { type: "segment" }>) {
   const { w, h, rgba, id } = req;
   const device = await pickDevice(req.device);
   const warnings: string[] = [];
-  const img = new RawImage(rgba, w, h, 4);
+
+  // Downscale image to 512px max for lightning-fast, crash-proof model inference.
+  // Both MODNet and SegFormer are natively trained on 512x512.
+  // Upsampling output masks back to (w, h) maintains crisp full-resolution outlines.
+  const modelInput = resizeForInference(rgba, w, h, 512);
+
   let matte: Float32Array | null = null;
   let matteModel: string | null = null;
   if (req.matteEnabled) {
     for (const model of matteFallbackChain(req.matteModel)) {
       try {
         post({ type: "status", id, message: `Loading matte model ${model}` });
-        const p = await loadPipe("background-removal", model, device, id, "matte");
+        const p = await withTimeout(
+          loadPipe("background-removal", model, device, id, "matte"),
+          30_000,
+          `Loading matte model ${model}`,
+        );
         post({ type: "status", id, message: "Separating the person from the background" });
-        const out = (await p(img)) as RawImage[];
+        const out = (await withTimeout(
+          p(modelInput) as Promise<RawImage[]>,
+          30_000,
+          "Matte model inference",
+        )) as RawImage[];
         matte = matteFromRGBA(out[0] as unknown as { data: Uint8ClampedArray; width: number; height: number; channels: number }, w, h);
         matteModel = model;
         break;
@@ -142,9 +168,20 @@ async function handleSegment(req: Extract<WorkerRequest, { type: "segment" }>) {
   if (req.parsingEnabled) {
     try {
       post({ type: "status", id, message: "Loading face-parsing model" });
-      const seg = await loadPipe("image-segmentation", PARSING_MODEL_ID, device, id, "parsing");
+      const seg = await withTimeout(
+        loadPipe("image-segmentation", PARSING_MODEL_ID, device, id, "parsing"),
+        40_000,
+        "Loading face-parsing model",
+      );
       post({ type: "status", id, message: "Finding face, hair, ears and glasses" });
-      labels = await parseWithCrop(seg, img, rgba, w, h);
+      type Seg = { label: string | null; mask: RawImage };
+      const segOutput = (await withTimeout(
+        seg(modelInput) as Promise<Seg[]>,
+        35_000,
+        "Face parsing inference",
+      )) as Seg[];
+      // labelMapFromSegments upsamples masks from 512px to full working size (w, h)
+      labels = labelMapFromSegments(segOutput, w, h);
     } catch (e) {
       if (isOom(e)) throw e;
       warnings.push(`Face parsing failed: ${(e as Error).message}`);
